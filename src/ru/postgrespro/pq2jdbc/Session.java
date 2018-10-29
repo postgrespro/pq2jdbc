@@ -13,6 +13,8 @@ public class Session implements Runnable
 	HashMap<String,PreparedStatement> prepared;
 	HashMap<String,PreparedStatement> portals;
 	Connection con;
+	String copyTarget;
+	PreparedStatement copyStmt;
 
 	public Session(Server thisServer, Socket socket) throws Exception
 	{
@@ -262,6 +264,43 @@ public class Session implements Runnable
 		return buf.toString();
 	}
 
+	static void bindParameter(PreparedStatement pstmt, int i, String value, int type) throws Exception
+	{
+		switch (type) {
+		case Types.BIGINT:
+			pstmt.setLong(i, Long.parseLong(value));
+			break;
+		case Types.BOOLEAN:
+			pstmt.setBoolean(i, Boolean.parseBoolean(value));
+			break;
+		case Types.DATE:
+			pstmt.setDate(i, Date.valueOf(value));
+			break;
+		case Types.DOUBLE:
+			pstmt.setDouble(i, Double.parseDouble(value));
+			break;
+		case Types.FLOAT:
+		case Types.REAL:
+			pstmt.setFloat(i, Float.parseFloat(value));
+			break;
+		case Types.INTEGER:
+			pstmt.setInt(i, Integer.parseInt(value));
+			break;
+		case Types.TIME:
+			pstmt.setTime(i, Time.valueOf(value));
+			break;
+		case Types.TIMESTAMP:
+			pstmt.setTimestamp(i, Timestamp.valueOf(value));
+			break;
+		case Types.TINYINT:
+			pstmt.setShort(i, (short)Integer.parseInt(value));
+			break;
+		default:
+			pstmt.setString(i, value);
+			break;
+		}
+	}
+
 	public void run()
 	{
 		try	{
@@ -275,7 +314,15 @@ public class Session implements Runnable
 					putMessage('Z', 'I');
 					sendReadyForQuery = false;
 				}
-				byte op = inputStream.readByte();
+				byte op;
+				try {
+					op = inputStream.readByte();
+				} catch (EOFException x) {
+					if (verbose) {
+						System.out.println("End of stream");
+					}
+					break;
+				}
 				int len = inputStream.readInt() - 4;
 				byte[] body = new byte[len];
 				inputStream.readFully(body);
@@ -286,6 +333,9 @@ public class Session implements Runnable
 				case 'Q': 	/* simple query */
 				{
 					String sql = new String(body, 0, body.length-1);
+					if (verbose) {
+						System.out.println("Receive query '" + sql + "'");
+					}
 					if (sql.startsWith("DEALLOCATE ")) {
 						String stmtName = sql.substring(11);
 						PreparedStatement pstmt = prepared.remove(stmtName);
@@ -293,15 +343,40 @@ public class Session implements Runnable
 							pstmt.close();
 						}
 						putMessage('C', "DEALLOCATE 0 1");
+						sendReadyForQuery = true;
+					} else if (sql.startsWith("copy ") || sql.startsWith("COPY ")) {
+						String tableName = sql.substring(5, sql.indexOf(' ',5));
+						PreparedStatement pstmt = con.prepareStatement("select * from " + tableName);
+						ResultSetMetaData meta = pstmt.getMetaData();
+
+						StringBuffer insert = new StringBuffer();
+						insert.append("insert into " + tableName + " values ");
+						char sep = '(';
+
+						ByteArrayOutputStream buf = new ByteArrayOutputStream();
+						DataOutputStream out = new DataOutputStream(buf);
+						int nColumns = meta.getColumnCount();
+						out.writeByte(0); // text format
+						out.writeShort(nColumns);
+						for (int i = 1; i <= nColumns; i++) {
+							insert.append(sep);
+							insert.append('?');
+							out.writeShort(0); // per column format
+							sep = ',';
+						}
+						insert.append(')');
+						pstmt.close();
+
+						out.flush();
+						putMessage('G', buf.toByteArray());
+
+						copyStmt = con.prepareStatement(insert.toString());
 					} else {
 						Statement stmt = con.createStatement();
-						if (verbose) {
-							System.out.println("Receive query '" + sql + "'");
-						}
 						stmt.execute(sql);
 						sendResult(stmt, Long.MAX_VALUE);
+						sendReadyForQuery = true;
 					}
-					sendReadyForQuery = true;
 					break;
 				}
 				case 'X':				/* terminate */
@@ -327,46 +402,15 @@ public class Session implements Runnable
 						System.out.println("Bind statement '" + stmtName + "', portal '" + portal + "'");
 					}
 					for (int i = 1; i <= numParams; i++) {
+						int type = meta.getParameterType(i);
 						len = unpackInt(body, beg);
 						beg += 4;
 						if (len < 0) {
-							pstmt.setNull(i, Types.VARCHAR);
+							pstmt.setNull(i, type);
 						} else {
 							String value = new String(body, beg, len);
 							beg += len;
-							switch (meta.getParameterType(i)) {
-							case Types.BIGINT:
-								pstmt.setLong(i, Long.parseLong(value));
-								break;
-							case Types.BOOLEAN:
-								pstmt.setBoolean(i, Boolean.parseBoolean(value));
-								break;
-							case Types.DATE:
-								pstmt.setDate(i, Date.valueOf(value));
-								break;
-							case Types.DOUBLE:
-								pstmt.setDouble(i, Double.parseDouble(value));
-								break;
-							case Types.FLOAT:
-							case Types.REAL:
-								pstmt.setFloat(i, Float.parseFloat(value));
-								break;
-							case Types.INTEGER:
-								pstmt.setInt(i, Integer.parseInt(value));
-								break;
-							case Types.TIME:
-								pstmt.setTime(i, Time.valueOf(value));
-								break;
-							case Types.TIMESTAMP:
-								pstmt.setTimestamp(i, Timestamp.valueOf(value));
-								break;
-							case Types.TINYINT:
-								pstmt.setShort(i, (short)Integer.parseInt(value));
-								break;
-							default:
-								pstmt.setString(i, value);
-								break;
-							}
+							bindParameter(pstmt, i, value, type);
 						}
 					}
 					portals.put(portal, pstmt);
@@ -485,8 +529,45 @@ public class Session implements Runnable
 					sendReadyForQuery = true;
 					break;
 				case 'd':				/* copy data */
+				{
+					if (copyStmt == null) {
+						throw new RuntimeException("Not in COPY state");
+					}
+					String copyData = new String(body, 0, body.length-1);
+					if (!copyData.equals("\\.")) {
+						String[] columns = copyData.trim().split("\t");
+						ParameterMetaData meta = copyStmt.getParameterMetaData();
+						int i;
+						for (i = 1; i <= columns.length; i++) {
+							String column = columns[i-1];
+							int type = meta.getParameterType(i);
+							if (column.equals("null")) {
+								copyStmt.setNull(i, type);
+							} else {
+								bindParameter(copyStmt, i, column, type);
+							}
+						}
+						int nColumns = meta.getParameterCount();
+						while (i <= nColumns) {
+							int type = meta.getParameterType(i);
+							copyStmt.setNull(i, type);
+							i += 1;
+						}
+						copyStmt.executeUpdate();
+					} else {
+						putMessage('c');
+					}
+					break;
+				}
 				case 'c':				/* copy done */
 				case 'f':				/* copy fail */
+				{
+					putMessage('C', "COPY 0"); // command tag
+					copyStmt.close();
+					copyStmt = null;
+					sendReadyForQuery = true;
+					break;
+				}
 				case 'F':				/* fastpath function call */
 				default:
 					throw new RuntimeException("Unknown message " + op);
