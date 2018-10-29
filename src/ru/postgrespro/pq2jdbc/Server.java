@@ -9,12 +9,15 @@ public class Server
 	String jdbcDriver;
 	String jdbcUrl;
 	boolean verbose;
-	public Server(int proxyPort, String driver, String url, boolean verboseMode) throws Exception
+	boolean translate;
+
+	public Server(int proxyPort, String driver, String url, boolean translateCommands, boolean verboseMode) throws Exception
 	{
 		serverSocket = new ServerSocket(proxyPort);
 		jdbcDriver = driver;
 		jdbcUrl = url;
 		verbose = verboseMode;
+		translate = translateCommands;
 		Class.forName("org." + driver + ".Driver");
 	}
 

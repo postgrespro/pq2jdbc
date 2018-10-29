@@ -12,6 +12,8 @@ public class Session implements Runnable
 	DataOutputStream outputStream;
 	HashMap<String,PreparedStatement> prepared;
 	HashMap<String,PreparedStatement> portals;
+	HashMap<String,PreparedStatement> cursors;
+	HashMap<String,Savepoint> savepoints;
 	Connection con;
 	String copyTarget;
 	PreparedStatement copyStmt;
@@ -23,6 +25,8 @@ public class Session implements Runnable
 		outputStream = new DataOutputStream(socket.getOutputStream());
 		prepared = new HashMap<String,PreparedStatement>();
 		portals = new HashMap<String,PreparedStatement>();
+		cursors = new HashMap<String,PreparedStatement>();
+		savepoints = new HashMap<String,Savepoint>();
 	}
 
 	static int strchr(byte[] buf, int offset, char ch)
@@ -195,32 +199,39 @@ public class Session implements Runnable
 		String commandTag;
 		boolean completed = true;
 		if (result != null) {
-			long nResults = 0;
-			ResultSetMetaData meta = result.getMetaData();
-			sendRowDescription(meta);
-			int nColumns = meta.getColumnCount();
-			while (result.next()) {
-				ByteArrayOutputStream buf = new ByteArrayOutputStream();
-				DataOutputStream out = new DataOutputStream(buf);
-				out.writeShort(nColumns);
-				for (int i = 1; i <= nColumns; i++) {
-					String val = result.getString(i);
-					if (val == null) {
-						out.writeInt(-1);
-					} else {
-						out.writeInt(val.length());
-						out.write(val.getBytes());
+			if (maxRows <= 0 && cursors.size() != 0) {
+				commandTag = "DECLARE 1";
+			} else {
+				long nResults = 0;
+				ResultSetMetaData meta = result.getMetaData();
+				sendRowDescription(meta);
+				int nColumns = meta.getColumnCount();
+				while (result.next()) {
+					ByteArrayOutputStream buf = new ByteArrayOutputStream();
+					DataOutputStream out = new DataOutputStream(buf);
+					out.writeShort(nColumns);
+					for (int i = 1; i <= nColumns; i++) {
+						String val = result.getString(i);
+						if (val == null) {
+							out.writeInt(-1);
+						} else {
+							out.writeInt(val.length());
+							out.write(val.getBytes());
+						}
+					}
+					out.flush();
+					putMessage('D', buf.toByteArray());
+					nResults += 1;
+					if (--maxRows == 0) {
+						completed = false;
+						break;
 					}
 				}
-				out.flush();
-				putMessage('D', buf.toByteArray());
-				nResults += 1;
-				if (--maxRows == 0) {
-					completed = false;
-					break;
+				commandTag = "SELECT " + nResults;
+				if (server.verbose) {
+					System.out.println("Send " + nResults + " rows");
 				}
 			}
-			commandTag = "SELECT " + nResults;
 		} else {
 			commandTag = "INSERT 0 " + stmt.getUpdateCount();
 		}
@@ -307,6 +318,7 @@ public class Session implements Runnable
 			Connection con = establishConnection();
 			boolean sendReadyForQuery = true;
 			boolean verbose = server.verbose;
+			boolean translate = server.translate;
 
 			while (true) {
 				if (sendReadyForQuery) {
@@ -336,14 +348,79 @@ public class Session implements Runnable
 					if (verbose) {
 						System.out.println("Receive query '" + sql + "'");
 					}
+					String tag = null;
 					if (sql.startsWith("DEALLOCATE ")) {
 						String stmtName = sql.substring(11);
-						PreparedStatement pstmt = prepared.remove(stmtName);
+						if (stmtName.equals("ALL")) {
+							for (PreparedStatement pstmt : prepared.values()) {
+								pstmt.close();
+							}
+							prepared.clear();
+							for (PreparedStatement pstmt : cursors.values()) {
+								pstmt.close();
+							}
+							cursors.clear();
+						} else {
+							PreparedStatement pstmt = prepared.remove(stmtName);
+							if (pstmt != null) {
+								pstmt.close();
+							}
+						}
+						tag = "DEALLOCATE 1";
+					} else if (translate && sql.startsWith("START TRANSACTION")) {
+						con.setAutoCommit(false);
+						tag = "START 1";
+					} else if (translate && sql.startsWith("COMMIT TRANSACTION")) {
+						con.commit();
+						con.setAutoCommit(true);
+						tag = "COMMIT 1";
+					} else if (translate && sql.startsWith("ABORT TRANSACTION")) {
+						con.rollback();
+						con.setAutoCommit(true);
+						tag = "ABORT 1";
+					} else if (translate && sql.startsWith("SAVEPOINT ")) {
+						String savepointName = sql.substring(10);
+						savepoints.put(savepointName, con.setSavepoint(savepointName));
+						tag = "SAVEPOINT 1";
+					} else if (translate && sql.startsWith("RELEASE SAVEPOINT ")) {
+						String savepointName = sql.substring(18);
+						Savepoint savepoint = savepoints.remove(savepointName);
+						if (savepoint != null) {
+							con.releaseSavepoint(savepoint);
+						}
+						tag = "RELEASE 1";
+					} else if (translate && sql.startsWith("ROLLBACK TO SAVEPOINT ")) {
+						String savepointName = sql.substring(22);
+						Savepoint savepoint = savepoints.remove(savepointName);
+						if (savepoint != null) {
+							con.rollback(savepoint);
+							con.releaseSavepoint(savepoint);
+						}
+						tag = "ROLLBACK 1";
+					} else if (translate && sql.startsWith("SET ")) {
+						// Currently just ignore all SET directives
+						tag = "SET 1";
+					} else if (translate && sql.startsWith("FETCH ")) {
+						int end = sql.indexOf(' ', 6);
+						int maxRows = Integer.parseInt(sql.substring(6, end));
+						String cursorName = sql.substring(end + 6); // skip FROM
+						PreparedStatement pstmt = cursors.get(cursorName);
+						if (verbose) {
+							System.out.println("Fetching " + maxRows + " from cursor " + cursorName);
+						}
+						try {
+							sendResult(pstmt, maxRows);
+						} catch (SQLException x) {
+							putMessage('E', "S" + x.getMessage() + "\0");
+						}
+						sendReadyForQuery = true;
+					} else if (translate && sql.startsWith("CLOSE ")) {
+						String cursorName = sql.substring(6);
+						PreparedStatement pstmt = cursors.remove(cursorName);
 						if (pstmt != null) {
 							pstmt.close();
 						}
-						putMessage('C', "DEALLOCATE 0 1");
-						sendReadyForQuery = true;
+						tag = "CLOSE 1";
 					} else if (sql.startsWith("copy ") || sql.startsWith("COPY ")) {
 						String tableName = sql.substring(5, sql.indexOf(' ',5));
 						PreparedStatement pstmt = con.prepareStatement("select * from " + tableName);
@@ -373,8 +450,16 @@ public class Session implements Runnable
 						copyStmt = con.prepareStatement(insert.toString());
 					} else {
 						Statement stmt = con.createStatement();
-						stmt.execute(sql);
-						sendResult(stmt, Long.MAX_VALUE);
+						try {
+							stmt.execute(sql);
+							sendResult(stmt, Long.MAX_VALUE);
+						} catch (SQLException x) {
+							putMessage('E', "S" + x.getMessage() + "\0");
+						}
+						sendReadyForQuery = true;
+					}
+					if (tag != null) {
+						putMessage('C', tag);
 						sendReadyForQuery = true;
 					}
 					break;
@@ -414,8 +499,13 @@ public class Session implements Runnable
 						}
 					}
 					portals.put(portal, pstmt);
+					try {
+						pstmt.execute();
+					} catch (SQLException x) {
+						putMessage('E', "S" + x.getMessage() + "\0");
+						break;
+					}
 					putMessage('2');
-					pstmt.execute();
 					break;
 				}
 				case 'E':				/* execute */
@@ -441,8 +531,20 @@ public class Session implements Runnable
 					if (verbose) {
 						System.out.println("Prepare statement " + name + ": '" + sql + "'");
 					}
-					PreparedStatement pstmt =  con.prepareStatement(sql);
+					String cursorName = null;
+					if (translate && sql.startsWith("DECLARE ")) {
+						end = sql.indexOf(' ', 8);
+						cursorName = sql.substring(8, end);
+						sql = sql.substring(end + 12); // skip CURSOR FOR
+						if (verbose) {
+							System.out.println("Translate DECLARE CURSOR " + cursorName + " to '" + sql + "'");
+						}
+					}
+					PreparedStatement pstmt = con.prepareStatement(sql);
 					prepared.put(name, pstmt);
+					if (cursorName != null) {
+						cursors.put(cursorName, pstmt);
+					}
 					putMessage('1');
 					break;
 				}
@@ -497,7 +599,7 @@ public class Session implements Runnable
 							putMessage('t', buf.toByteArray());
 
 							ResultSetMetaData resultDesc = pstmt.getMetaData();
-							if (resultDesc == null) {
+							if (resultDesc == null || cursors.size() != 0) {
 								putMessage('n');
 							} else {
 								sendRowDescription(resultDesc);
@@ -510,7 +612,7 @@ public class Session implements Runnable
 						PreparedStatement pstmt = portals.get(describeTarget);
 						if (pstmt != null) {
 							ResultSetMetaData resultDesc = pstmt.getMetaData();
-							if (resultDesc == null) {
+							if (resultDesc == null || cursors.size() != 0) {
 								putMessage('n');
 							} else {
 								sendRowDescription(resultDesc);

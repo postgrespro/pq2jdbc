@@ -8,6 +8,7 @@ public class Main
 		String url = "";
 		String driver = "postgresql";
 		boolean verbose = false;
+		boolean translate = false;
 
 		for (int i = 0; i < args.length; i++) {
 			if (args[i].charAt(0) == '-') {
@@ -24,19 +25,23 @@ public class Main
 				case 'v':
 					verbose = true;
 					continue;
+				case 't':
+					translate = true;
+					continue;
 				default:
 					break;
 				}
 			}
 			System.err.println("Usage: java Server {options}\n" +
 							   "Options:\n" +
-							   "\t-v\tverbose mode\n" + 
-							   "\t-p PORT\tserver port\n" + 
-							   "\t-c URL\tJDBC URL\n" + 
+							   "\t-v\tverbose mode\n" +
+							   "\t-t\ttranslate Postgres specific commands\n" +
+							   "\t-p PORT\tserver port\n" +
+							   "\t-c URL\tJDBC URL\n" +
 							   "\t-d URL\tJDBC driver");
 			return;
 		}
-		Server server = new Server(port, driver, url, verbose);
+		Server server = new Server(port, driver, url, translate, verbose);
 		server.start();
 	}
 }
