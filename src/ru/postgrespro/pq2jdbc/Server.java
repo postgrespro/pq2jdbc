@@ -18,7 +18,7 @@ public class Server
 		jdbcUrl = url;
 		verbose = verboseMode;
 		translate = translateCommands;
-		Class.forName("org." + driver + ".Driver");
+		Class.forName(driver);
 	}
 
 	void start() throws Exception

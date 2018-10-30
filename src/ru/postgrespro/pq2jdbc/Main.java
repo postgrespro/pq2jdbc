@@ -5,8 +5,8 @@ public class Main
 	public static void main(String[] args) throws Exception
 	{
 		int port = 5433;
-		String url = "";
-		String driver = "postgresql";
+		String url = "postgresql:";
+		String driver = "org.postgresql.Driver";
 		boolean verbose = false;
 		boolean translate = false;
 

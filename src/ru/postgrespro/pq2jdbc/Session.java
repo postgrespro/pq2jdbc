@@ -92,7 +92,7 @@ public class Session implements Runnable
 		outputStream.writeInt(-1); // cancel key
 		outputStream.flush();
 
-		return DriverManager.getConnection("jdbc:" + server.jdbcDriver + ":" + server.jdbcUrl + database, user, password);
+		return DriverManager.getConnection("jdbc:" + server.jdbcUrl + database, user, password);
 	}
 
 	void putMessage(char op, byte[] buf) throws IOException
@@ -275,6 +275,18 @@ public class Session implements Runnable
 		return buf.toString();
 	}
 
+	static String trimSemicolon(String sql) throws Exception
+	{
+		String newSql = sql.trim();
+		int end = newSql.length();
+
+		if (newSql.charAt(end - 1) == ';') {
+			newSql = newSql.substring(0, end - 1);
+		}
+
+		return newSql;
+	}
+
 	static void bindParameter(PreparedStatement pstmt, int i, String value, int type) throws Exception
 	{
 		switch (type) {
@@ -345,6 +357,11 @@ public class Session implements Runnable
 				case 'Q': 	/* simple query */
 				{
 					String sql = new String(body, 0, body.length-1);
+
+					if (translate) {
+						sql = trimSemicolon(sql);
+					}
+
 					if (verbose) {
 						System.out.println("Receive query '" + sql + "'");
 					}
@@ -371,7 +388,12 @@ public class Session implements Runnable
 						con.setAutoCommit(false);
 						tag = "START 1";
 					} else if (translate && sql.startsWith("COMMIT TRANSACTION")) {
-						con.commit();
+						try {
+							con.commit();
+						} catch (SQLException x) {
+							if (verbose)
+								System.out.println("SQLException: skipping commit");
+						}
 						con.setAutoCommit(true);
 						tag = "COMMIT 1";
 					} else if (translate && sql.startsWith("ABORT TRANSACTION")) {
@@ -482,12 +504,21 @@ public class Session implements Runnable
 					int numParams = unpackShort(body,  beg);
 					beg += 2;
 					PreparedStatement pstmt = prepared.get(stmtName);
-					ParameterMetaData meta = pstmt.getParameterMetaData();
+					ParameterMetaData meta = null;
+
+					try {
+						meta = pstmt.getParameterMetaData();
+					} catch (SQLException e) {
+						if (verbose) {
+							System.out.println("SQLException: skipping getParameterMetaData");
+						}
+					}
+					
 					if (verbose) {
 						System.out.println("Bind statement '" + stmtName + "', portal '" + portal + "'");
 					}
 					for (int i = 1; i <= numParams; i++) {
-						int type = meta.getParameterType(i);
+						int type = meta == null ? Types.VARCHAR : meta.getParameterType(i);
 						len = unpackInt(body, beg);
 						beg += 4;
 						if (len < 0) {
@@ -528,6 +559,11 @@ public class Session implements Runnable
 					end = strchr(body, beg, '\0');
 					String sql = new String(body, beg, end - beg);
 					sql = replacePlaceholders(sql);
+
+					if (translate) {
+						sql = sql.replaceAll("\"default\".", "default.");
+					}
+
 					if (verbose) {
 						System.out.println("Prepare statement " + name + ": '" + sql + "'");
 					}
@@ -611,7 +647,15 @@ public class Session implements Runnable
 					{
 						PreparedStatement pstmt = portals.get(describeTarget);
 						if (pstmt != null) {
-							ResultSetMetaData resultDesc = pstmt.getMetaData();
+							ResultSetMetaData resultDesc = null;
+							try {
+								resultDesc = pstmt.getMetaData();
+							} catch (SQLException x) {
+								ResultSet result = pstmt.getResultSet();
+								if (result != null) {
+									resultDesc = result.getMetaData();
+								}
+							}
 							if (resultDesc == null || cursors.size() != 0) {
 								putMessage('n');
 							} else {
