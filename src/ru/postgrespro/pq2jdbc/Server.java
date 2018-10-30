@@ -23,7 +23,7 @@ public class Server
 
 	void start() throws Exception
 	{
-		while (true) { 
+		while (true) {
 			Socket clientSocket = serverSocket.accept();
 			clientSocket.setTcpNoDelay(true);
 			Session session = new Session(this, clientSocket);

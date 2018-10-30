@@ -17,6 +17,9 @@ public class Session implements Runnable
 	Connection con;
 	String copyTarget;
 	PreparedStatement copyStmt;
+	int nPreparedStmtParams;
+
+	static final int IMPLICIT_PARAM_TYPE = Types.VARCHAR;
 
 	public Session(Server thisServer, Socket socket) throws Exception
 	{
@@ -391,13 +394,20 @@ public class Session implements Runnable
 						try {
 							con.commit();
 						} catch (SQLException x) {
-							if (verbose)
+							if (verbose) {
 								System.out.println("SQLException: skipping commit");
+							}
 						}
 						con.setAutoCommit(true);
 						tag = "COMMIT 1";
 					} else if (translate && sql.startsWith("ABORT TRANSACTION")) {
-						con.rollback();
+						try {
+							con.rollback();
+						} catch (SQLException x) {
+							if (verbose) {
+								System.out.println("SQLException: skipping rollback");
+							}
+						}
 						con.setAutoCommit(true);
 						tag = "ABORT 1";
 					} else if (translate && sql.startsWith("SAVEPOINT ")) {
@@ -445,9 +455,15 @@ public class Session implements Runnable
 						tag = "CLOSE 1";
 					} else if (sql.startsWith("copy ") || sql.startsWith("COPY ")) {
 						String tableName = sql.substring(5, sql.indexOf(' ',5));
-						PreparedStatement pstmt = con.prepareStatement("select * from " + tableName);
-						ResultSetMetaData meta = pstmt.getMetaData();
+						PreparedStatement pstmt = con.prepareStatement("select * from " + tableName + " limit 1");
+						ResultSetMetaData meta = null;
 
+						try {
+							meta = pstmt.getMetaData();
+						} catch (SQLException x) {
+							ResultSet result = pstmt.executeQuery();
+							meta = result.getMetaData();
+						}
 						StringBuffer insert = new StringBuffer();
 						insert.append("insert into " + tableName + " values ");
 						char sep = '(';
@@ -455,6 +471,7 @@ public class Session implements Runnable
 						ByteArrayOutputStream buf = new ByteArrayOutputStream();
 						DataOutputStream out = new DataOutputStream(buf);
 						int nColumns = meta.getColumnCount();
+						nPreparedStmtParams = nColumns;
 						out.writeByte(0); // text format
 						out.writeShort(nColumns);
 						for (int i = 1; i <= nColumns; i++) {
@@ -509,16 +526,17 @@ public class Session implements Runnable
 					try {
 						meta = pstmt.getParameterMetaData();
 					} catch (SQLException e) {
+						nPreparedStmtParams = numParams;
 						if (verbose) {
 							System.out.println("SQLException: skipping getParameterMetaData");
 						}
 					}
-					
+
 					if (verbose) {
 						System.out.println("Bind statement '" + stmtName + "', portal '" + portal + "'");
 					}
 					for (int i = 1; i <= numParams; i++) {
-						int type = meta == null ? Types.VARCHAR : meta.getParameterType(i);
+						int type = meta != null ? meta.getParameterType(i) : IMPLICIT_PARAM_TYPE;
 						len = unpackInt(body, beg);
 						beg += 4;
 						if (len < 0) {
@@ -623,18 +641,29 @@ public class Session implements Runnable
 						if (pstmt != null) {
 							ByteArrayOutputStream buf = new ByteArrayOutputStream();
 							DataOutputStream out = new DataOutputStream(buf);
-							ParameterMetaData paramDesc = pstmt.getParameterMetaData();
-							int nParams = paramDesc.getParameterCount();
+							ResultSetMetaData resultDesc = null;
+							ParameterMetaData paramDesc = null;
+							int nParams;
+							try {
+								resultDesc = pstmt.getMetaData();
+								paramDesc = pstmt.getParameterMetaData();
+								nParams = paramDesc.getParameterCount();
+							} catch (SQLException x) {
+								ResultSet result = pstmt.getResultSet();
+								if (result != null) {
+									resultDesc = result.getMetaData();
+								}
+								nParams = nPreparedStmtParams;
+							}
 							// first describe parameters
 							out.writeShort(nParams);
 							for (int i = 1; i <= nParams; i++) {
-								int type = paramDesc.getParameterType(i);
+								int type = paramDesc != null ? paramDesc.getParameterType(i) : IMPLICIT_PARAM_TYPE;
 								out.writeInt(getTypeOid(type));
 							}
 							out.flush();
 							putMessage('t', buf.toByteArray());
 
-							ResultSetMetaData resultDesc = pstmt.getMetaData();
 							if (resultDesc == null || cursors.size() != 0) {
 								putMessage('n');
 							} else {
@@ -682,20 +711,26 @@ public class Session implements Runnable
 					String copyData = new String(body, 0, body.length-1);
 					if (!copyData.equals("\\.")) {
 						String[] columns = copyData.trim().split("\t");
-						ParameterMetaData meta = copyStmt.getParameterMetaData();
+						ParameterMetaData meta = null;
+						int nColumns;
+						try {
+							meta = copyStmt.getParameterMetaData();
+							nColumns = meta.getParameterCount();
+						} catch (SQLException x) {
+							nColumns = nPreparedStmtParams;
+						}
 						int i;
 						for (i = 1; i <= columns.length; i++) {
 							String column = columns[i-1];
-							int type = meta.getParameterType(i);
+							int type = meta != null ? meta.getParameterType(i) : IMPLICIT_PARAM_TYPE;
 							if (column.equals("null")) {
 								copyStmt.setNull(i, type);
 							} else {
 								bindParameter(copyStmt, i, column, type);
 							}
 						}
-						int nColumns = meta.getParameterCount();
 						while (i <= nColumns) {
-							int type = meta.getParameterType(i);
+							int type = meta != null ? meta.getParameterType(i) : IMPLICIT_PARAM_TYPE;
 							copyStmt.setNull(i, type);
 							i += 1;
 						}
