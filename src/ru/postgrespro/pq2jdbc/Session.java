@@ -18,6 +18,7 @@ public class Session implements Runnable
 	String copyTarget;
 	PreparedStatement copyStmt;
 	int nPreparedStmtParams;
+	ResultSet currentResult;
 
 	static final int IMPLICIT_PARAM_TYPE = Types.VARCHAR;
 
@@ -198,7 +199,7 @@ public class Session implements Runnable
 
 	boolean sendResult(Statement stmt, long maxRows) throws Exception
 	{
-		ResultSet result = stmt.getResultSet();
+		ResultSet result = currentResult == null ? stmt.getResultSet() : currentResult;
 		String commandTag;
 		boolean completed = true;
 		if (result != null) {
@@ -229,6 +230,9 @@ public class Session implements Runnable
 						completed = false;
 						break;
 					}
+				}
+				if (completed) {
+					result.close();
 				}
 				commandTag = "SELECT " + nResults;
 				if (server.verbose) {
@@ -388,7 +392,13 @@ public class Session implements Runnable
 						}
 						tag = "DEALLOCATE 1";
 					} else if (translate && sql.startsWith("START TRANSACTION")) {
-						con.setAutoCommit(false);
+						// Ignite rises "SQLFeatureNotSupportedException: Transactions are not supported."
+						// on setAutoCommit(false) call.
+						try {
+							con.setAutoCommit(false);
+						} catch (SQLException x) {
+							System.out.println("SQLException: skipping setAutoCommit(false)");
+						}
 						tag = "START 1";
 					} else if (translate && sql.startsWith("COMMIT TRANSACTION")) {
 						try {
@@ -443,6 +453,7 @@ public class Session implements Runnable
 						try {
 							sendResult(pstmt, maxRows);
 						} catch (SQLException x) {
+							x.printStackTrace();
 							putMessage('E', "S" + x.getMessage() + "\0");
 						}
 						sendReadyForQuery = true;
@@ -491,8 +502,10 @@ public class Session implements Runnable
 						Statement stmt = con.createStatement();
 						try {
 							stmt.execute(sql);
+							currentResult = null;
 							sendResult(stmt, Long.MAX_VALUE);
 						} catch (SQLException x) {
+							x.printStackTrace();
 							putMessage('E', "S" + x.getMessage() + "\0");
 						}
 						sendReadyForQuery = true;
@@ -549,8 +562,13 @@ public class Session implements Runnable
 					}
 					portals.put(portal, pstmt);
 					try {
-						pstmt.execute();
+						if (pstmt.execute()) {
+							currentResult = pstmt.getResultSet();
+						} else {
+							currentResult = null;
+						}
 					} catch (SQLException x) {
+						x.printStackTrace();
 						putMessage('E', "S" + x.getMessage() + "\0");
 						break;
 					}
@@ -649,9 +667,8 @@ public class Session implements Runnable
 								paramDesc = pstmt.getParameterMetaData();
 								nParams = paramDesc.getParameterCount();
 							} catch (SQLException x) {
-								ResultSet result = pstmt.getResultSet();
-								if (result != null) {
-									resultDesc = result.getMetaData();
+								if (currentResult != null) {
+									resultDesc = currentResult.getMetaData();
 								}
 								nParams = nPreparedStmtParams;
 							}
@@ -680,9 +697,8 @@ public class Session implements Runnable
 							try {
 								resultDesc = pstmt.getMetaData();
 							} catch (SQLException x) {
-								ResultSet result = pstmt.getResultSet();
-								if (result != null) {
-									resultDesc = result.getMetaData();
+								if (currentResult != null) {
+									resultDesc = currentResult.getMetaData();
 								}
 							}
 							if (resultDesc == null || cursors.size() != 0) {
