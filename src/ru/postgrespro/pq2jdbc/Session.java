@@ -495,11 +495,12 @@ public class Session implements Runnable
 						String tableName = sql.substring(5, sql.indexOf(' ',5));
 						PreparedStatement pstmt = con.prepareStatement("select * from " + tableName + " limit 1");
 						ResultSetMetaData meta = null;
+						ResultSet result = null;
 
 						try {
 							meta = pstmt.getMetaData();
 						} catch (SQLException x) {
-							ResultSet result = pstmt.executeQuery();
+							result = pstmt.executeQuery();
 							meta = result.getMetaData();
 						}
 						StringBuffer insert = new StringBuffer();
@@ -518,6 +519,9 @@ public class Session implements Runnable
 							sep = ',';
 						}
 						insert.append(')');
+						if (result != null) {
+							result.close();
+						}
 						pstmt.close();
 
 						out.flush();
@@ -753,7 +757,7 @@ public class Session implements Runnable
 						String[] columns = copyData.trim().split("\t");
 						int nColumns = copy.paramTypes.length;
 						int i;
-						for (i = 1; i <= nColumns; i++) {
+						for (i = 1; i <= columns.length; i++) {
 							String column = columns[i-1];
 							int type = copy.paramTypes[i-1];
 							if (column.equals("null")) {
