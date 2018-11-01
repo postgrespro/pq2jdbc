@@ -10,26 +10,52 @@ public class Session implements Runnable
 	Server server;
 	DataInputStream inputStream;
 	DataOutputStream outputStream;
-	HashMap<String,PreparedStatement> prepared;
-	HashMap<String,PreparedStatement> portals;
-	HashMap<String,PreparedStatement> cursors;
+	HashMap<String,Plan> prepared;
+	HashMap<String,Plan> portals;
+	HashMap<String,Plan> cursors;
 	HashMap<String,Savepoint> savepoints;
 	Connection con;
-	String copyTarget;
-	PreparedStatement copyStmt;
-	int nPreparedStmtParams;
-	ResultSet currentResult;
+	Plan copy;
 
 	static final int IMPLICIT_PARAM_TYPE = Types.VARCHAR;
+
+	static class Plan
+	{
+		PreparedStatement stmt;
+		ResultSet         result;
+		int[]             paramTypes;
+		String            cursorName;
+
+		void reset() throws SQLException
+		{
+			if (result != null) {
+				result.close();
+				result = null;
+			}
+		}
+
+		void close() throws SQLException
+		{
+			reset();
+			if (stmt != null) {
+				stmt.close();
+				stmt = null;
+			}
+		}
+
+		Plan(PreparedStatement pstmt) {
+			stmt = pstmt;
+		}
+	}
 
 	public Session(Server thisServer, Socket socket) throws Exception
 	{
 		server = thisServer;
 		inputStream = new DataInputStream(socket.getInputStream());
 		outputStream = new DataOutputStream(socket.getOutputStream());
-		prepared = new HashMap<String,PreparedStatement>();
-		portals = new HashMap<String,PreparedStatement>();
-		cursors = new HashMap<String,PreparedStatement>();
+		prepared = new HashMap<String,Plan>();
+		portals = new HashMap<String,Plan>();
+		cursors = new HashMap<String,Plan>();
 		savepoints = new HashMap<String,Savepoint>();
 	}
 
@@ -197,9 +223,8 @@ public class Session implements Runnable
 		putMessage('T', buf.toByteArray());
 	}
 
-	boolean sendResult(Statement stmt, long maxRows) throws Exception
+	boolean sendResult(Statement stmt, ResultSet result, long maxRows) throws Exception
 	{
-		ResultSet result = currentResult == null ? stmt.getResultSet() : currentResult;
 		String commandTag;
 		boolean completed = true;
 		if (result != null) {
@@ -230,9 +255,6 @@ public class Session implements Runnable
 						completed = false;
 						break;
 					}
-				}
-				if (completed) {
-					result.close();
 				}
 				commandTag = "SELECT " + nResults;
 				if (server.verbose) {
@@ -376,18 +398,21 @@ public class Session implements Runnable
 					if (sql.startsWith("DEALLOCATE ")) {
 						String stmtName = sql.substring(11);
 						if (stmtName.equals("ALL")) {
-							for (PreparedStatement pstmt : prepared.values()) {
-								pstmt.close();
+							for (Plan plan : prepared.values()) {
+								plan.close();
 							}
 							prepared.clear();
-							for (PreparedStatement pstmt : cursors.values()) {
-								pstmt.close();
+							for (Plan plan : cursors.values()) {
+								plan.close();
 							}
 							cursors.clear();
 						} else {
-							PreparedStatement pstmt = prepared.remove(stmtName);
-							if (pstmt != null) {
-								pstmt.close();
+							Plan plan = prepared.remove(stmtName);
+							if (plan != null) {
+								plan.close();
+								if (plan.cursorName != null) {
+									cursors.remove(plan.cursorName);
+								}
 							}
 						}
 						tag = "DEALLOCATE 1";
@@ -446,12 +471,12 @@ public class Session implements Runnable
 						int end = sql.indexOf(' ', 6);
 						int maxRows = Integer.parseInt(sql.substring(6, end));
 						String cursorName = sql.substring(end + 6); // skip FROM
-						PreparedStatement pstmt = cursors.get(cursorName);
+						Plan plan = cursors.get(cursorName);
 						if (verbose) {
 							System.out.println("Fetching " + maxRows + " from cursor " + cursorName);
 						}
 						try {
-							sendResult(pstmt, maxRows);
+							sendResult(plan.stmt, plan.result, maxRows);
 						} catch (SQLException x) {
 							x.printStackTrace();
 							putMessage('E', "S" + x.getMessage() + "\0");
@@ -459,11 +484,13 @@ public class Session implements Runnable
 						sendReadyForQuery = true;
 					} else if (translate && sql.startsWith("CLOSE ")) {
 						String cursorName = sql.substring(6);
-						PreparedStatement pstmt = cursors.remove(cursorName);
-						if (pstmt != null) {
-							pstmt.close();
+						Plan plan = cursors.get(cursorName);
+						if (plan != null) {
+							plan.reset();
+							tag = "CLOSE 1";
+						} else {
+							tag = "CLOSE 0";
 						}
-						tag = "CLOSE 1";
 					} else if (sql.startsWith("copy ") || sql.startsWith("COPY ")) {
 						String tableName = sql.substring(5, sql.indexOf(' ',5));
 						PreparedStatement pstmt = con.prepareStatement("select * from " + tableName + " limit 1");
@@ -482,7 +509,6 @@ public class Session implements Runnable
 						ByteArrayOutputStream buf = new ByteArrayOutputStream();
 						DataOutputStream out = new DataOutputStream(buf);
 						int nColumns = meta.getColumnCount();
-						nPreparedStmtParams = nColumns;
 						out.writeByte(0); // text format
 						out.writeShort(nColumns);
 						for (int i = 1; i <= nColumns; i++) {
@@ -497,13 +523,29 @@ public class Session implements Runnable
 						out.flush();
 						putMessage('G', buf.toByteArray());
 
-						copyStmt = con.prepareStatement(insert.toString());
+						copy = new Plan(con.prepareStatement(insert.toString()));
+						copy.paramTypes = new int[nColumns];
+						try {
+							ParameterMetaData paramDesc = copy.stmt.getParameterMetaData();
+							for (int i = 0; i < nColumns; i++) {
+								copy.paramTypes[i] = paramDesc.getParameterType(i+1);
+							}
+						} catch (SQLException x) {
+							for (int i = 0; i < nColumns; i++) {
+								copy.paramTypes[i] =  IMPLICIT_PARAM_TYPE;
+							}
+						}
 					} else {
 						Statement stmt = con.createStatement();
 						try {
-							stmt.execute(sql);
-							currentResult = null;
-							sendResult(stmt, Long.MAX_VALUE);
+							ResultSet result = null;
+							if (stmt.execute(sql)) {
+								result = stmt.getResultSet();
+							}
+							sendResult(stmt, result, Long.MAX_VALUE);
+							if (result != null) {
+								result.close();
+							}
 						} catch (SQLException x) {
 							x.printStackTrace();
 							putMessage('E', "S" + x.getMessage() + "\0");
@@ -533,13 +575,18 @@ public class Session implements Runnable
 					beg += 2 + numFormats*2;
 					int numParams = unpackShort(body,  beg);
 					beg += 2;
-					PreparedStatement pstmt = prepared.get(stmtName);
-					ParameterMetaData meta = null;
+					Plan plan = prepared.get(stmtName);
+					plan.paramTypes = new int[numParams];
 
 					try {
-						meta = pstmt.getParameterMetaData();
-					} catch (SQLException e) {
-						nPreparedStmtParams = numParams;
+						ParameterMetaData meta = plan.stmt.getParameterMetaData();
+						for (int i = 0; i < numParams; i++) {
+							plan.paramTypes[i] = meta.getParameterType(i+1);
+						}
+					} catch (SQLException x) {
+						for (int i = 0; i < numParams; i++) {
+							plan.paramTypes[i] = IMPLICIT_PARAM_TYPE;
+						}
 						if (verbose) {
 							System.out.println("SQLException: skipping getParameterMetaData");
 						}
@@ -549,23 +596,21 @@ public class Session implements Runnable
 						System.out.println("Bind statement '" + stmtName + "', portal '" + portal + "'");
 					}
 					for (int i = 1; i <= numParams; i++) {
-						int type = meta != null ? meta.getParameterType(i) : IMPLICIT_PARAM_TYPE;
+						int type = plan.paramTypes[i-1];
 						len = unpackInt(body, beg);
 						beg += 4;
 						if (len < 0) {
-							pstmt.setNull(i, type);
+							plan.stmt.setNull(i, type);
 						} else {
 							String value = new String(body, beg, len);
 							beg += len;
-							bindParameter(pstmt, i, value, type);
+							bindParameter(plan.stmt, i, value, type);
 						}
 					}
-					portals.put(portal, pstmt);
+					portals.put(portal, plan);
 					try {
-						if (pstmt.execute()) {
-							currentResult = pstmt.getResultSet();
-						} else {
-							currentResult = null;
+						if (plan.stmt.execute()) {
+							plan.result = plan.stmt.getResultSet();
 						}
 					} catch (SQLException x) {
 						x.printStackTrace();
@@ -582,8 +627,8 @@ public class Session implements Runnable
 					String portal = new String(body, beg, end - beg);
 					beg = end + 1;
 					int maxRows = unpackInt(body, beg);
-					PreparedStatement pstmt = portals.get(portal);
-					sendResult(pstmt, maxRows);
+					Plan plan = portals.get(portal);
+					sendResult(plan.stmt, plan.result, maxRows);
 					break;
 				}
 				case 'P':				/* parse */
@@ -612,10 +657,11 @@ public class Session implements Runnable
 							System.out.println("Translate DECLARE CURSOR " + cursorName + " to '" + sql + "'");
 						}
 					}
-					PreparedStatement pstmt = con.prepareStatement(sql);
-					prepared.put(name, pstmt);
+					Plan plan = new Plan(con.prepareStatement(sql));
+					prepared.put(name, plan);
 					if (cursorName != null) {
-						cursors.put(cursorName, pstmt);
+						plan.cursorName = cursorName;
+						cursors.put(cursorName, plan);
 					}
 					putMessage('1');
 					break;
@@ -628,18 +674,18 @@ public class Session implements Runnable
 					switch (closeType) {
 					case 'S':
 					{
-						PreparedStatement pstmt = prepared.remove(closeTarget);
-						if (pstmt != null) {
-							pstmt.close();
+						Plan plan = prepared.remove(closeTarget);
+						if (plan != null) {
+							plan.close();
+						}
+						if (plan.cursorName != null) {
+							cursors.remove(plan.cursorName);
 						}
 						break;
 					}
 					case 'P':
 					{
-						PreparedStatement pstmt = portals.remove(closeTarget);
-						if (pstmt != null) {
-							pstmt.close();
-						}
+						portals.remove(closeTarget);
 						break;
 					}
 					default:
@@ -655,56 +701,34 @@ public class Session implements Runnable
 					switch (describeType) {
 					case 'S':
 					{
-						PreparedStatement pstmt = prepared.get(describeTarget);
-						if (pstmt != null) {
+						Plan plan = prepared.get(describeTarget);
+						if (plan != null) {
 							ByteArrayOutputStream buf = new ByteArrayOutputStream();
 							DataOutputStream out = new DataOutputStream(buf);
-							ResultSetMetaData resultDesc = null;
-							ParameterMetaData paramDesc = null;
-							int nParams;
-							try {
-								resultDesc = pstmt.getMetaData();
-								paramDesc = pstmt.getParameterMetaData();
-								nParams = paramDesc.getParameterCount();
-							} catch (SQLException x) {
-								if (currentResult != null) {
-									resultDesc = currentResult.getMetaData();
-								}
-								nParams = nPreparedStmtParams;
-							}
 							// first describe parameters
-							out.writeShort(nParams);
-							for (int i = 1; i <= nParams; i++) {
-								int type = paramDesc != null ? paramDesc.getParameterType(i) : IMPLICIT_PARAM_TYPE;
-								out.writeInt(getTypeOid(type));
+							out.writeShort(plan.paramTypes.length);
+							for (int i = 0; i < plan.paramTypes.length; i++) {
+								out.writeInt(getTypeOid(plan.paramTypes[i]));
 							}
 							out.flush();
 							putMessage('t', buf.toByteArray());
 
-							if (resultDesc == null || cursors.size() != 0) {
+							if (plan.result == null || cursors.size() != 0) {
 								putMessage('n');
 							} else {
-								sendRowDescription(resultDesc);
+								sendRowDescription(plan.result.getMetaData());
 							}
 						}
 						break;
 					}
 					case 'P':
 					{
-						PreparedStatement pstmt = portals.get(describeTarget);
-						if (pstmt != null) {
-							ResultSetMetaData resultDesc = null;
-							try {
-								resultDesc = pstmt.getMetaData();
-							} catch (SQLException x) {
-								if (currentResult != null) {
-									resultDesc = currentResult.getMetaData();
-								}
-							}
-							if (resultDesc == null || cursors.size() != 0) {
+						Plan plan = portals.get(describeTarget);
+						if (plan != null) {
+							if (plan.result == null || cursors.size() != 0) {
 								putMessage('n');
 							} else {
-								sendRowDescription(resultDesc);
+								sendRowDescription(plan.result.getMetaData());
 							}
 						}
 						break;
@@ -721,36 +745,29 @@ public class Session implements Runnable
 					break;
 				case 'd':				/* copy data */
 				{
-					if (copyStmt == null) {
+					if (copy == null) {
 						throw new RuntimeException("Not in COPY state");
 					}
 					String copyData = new String(body, 0, body.length-1);
 					if (!copyData.equals("\\.")) {
 						String[] columns = copyData.trim().split("\t");
-						ParameterMetaData meta = null;
-						int nColumns;
-						try {
-							meta = copyStmt.getParameterMetaData();
-							nColumns = meta.getParameterCount();
-						} catch (SQLException x) {
-							nColumns = nPreparedStmtParams;
-						}
+						int nColumns = copy.paramTypes.length;
 						int i;
-						for (i = 1; i <= columns.length; i++) {
+						for (i = 1; i <= nColumns; i++) {
 							String column = columns[i-1];
-							int type = meta != null ? meta.getParameterType(i) : IMPLICIT_PARAM_TYPE;
+							int type = copy.paramTypes[i-1];
 							if (column.equals("null")) {
-								copyStmt.setNull(i, type);
+								copy.stmt.setNull(i, type);
 							} else {
-								bindParameter(copyStmt, i, column, type);
+								bindParameter(copy.stmt, i, column, type);
 							}
 						}
 						while (i <= nColumns) {
-							int type = meta != null ? meta.getParameterType(i) : IMPLICIT_PARAM_TYPE;
-							copyStmt.setNull(i, type);
+							int type = copy.paramTypes[i-1];
+							copy.stmt.setNull(i, type);
 							i += 1;
 						}
-						copyStmt.executeUpdate();
+						copy.stmt.executeUpdate();
 					} else {
 						putMessage('c');
 					}
@@ -760,8 +777,10 @@ public class Session implements Runnable
 				case 'f':				/* copy fail */
 				{
 					putMessage('C', "COPY 0"); // command tag
-					copyStmt.close();
-					copyStmt = null;
+					if (copy != null) { 
+						copy.close();
+						copy = null;
+					}
 					sendReadyForQuery = true;
 					break;
 				}
