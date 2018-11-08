@@ -1,0 +1,37 @@
+pq2jdbc is bridge between PostgreSQL libpq client and any JDBC-compatible database.
+It's java application, which should be started on some port and simulate Postgres server.
+It connects through JDBC driver to any JDBC-compatible database, redirects libpq requests
+to it and receives replies.
+
+Why it is needed?
+The primary goal of this application was to provide access from Postgres
+to HIVE and Apache Ignite. There is Postgres JDBC FDW https://github.com/atris/JDBC_FDW
+but it has the following limitations:
+1. It is read-only and doesn't support updates.
+2. It establishes new connection on each query, so speed is awful.
+
+Certainly it is possible to impalement improved version of this FDW.
+But development of good FDW (supporting index scans, push-downs, ...) is quite sophisticated task.
+The idea was to use postgres_fdw and connect through pq2jdbc bridge to any JDBC-compatible database.
+
+Another use case (not sure how useful it is) is to allow postgres unities and clients to access another
+databases. For example it is possible to use pgbench to benchmark mySQL or Oracle.
+
+If somebody find another use cases for this application, please let me know:)
+
+How to use?
+First of all you need to get JDBC driver for the target database.
+Then launch pq2jdbc like this
+
+   java -cp pq2jdbc.jar:postgresql-42.1.4.jar ru.postgrespro.pq2jdbc.Main -v -t
+
+Supported options are:
+	-v	    verbose mode
+	-t	  	translate Postgres specific commands
+	-p PORT	server port (default: 5432)
+	-c URL  JDBC URL (default: "postgresql:")
+	-d URL  JDBC driver (default: "org.postgresql.Driver")
+
+
+-t option makes pq2jdbc to translated PostgreSQL specific commands (transactio control, cursor manipulation,...) to standard SQL commands.
+In verbose mode pq2jdbc display all executed commands.
